@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+uv.lock
+
+# 运行产物
+e2e_test/
+gui_launch.log
+e2e_log.txt
+_work/
+character_dataset_*/
+output/
+
+# 模型缓存
+*.onnx
