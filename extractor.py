@@ -5,7 +5,7 @@
 #   "numpy<2",
 #   "onnxruntime",
 #   "av>=12",
-#   "gradio>=4.44",
+#   "gradio>=4.44,<6",
 #   "huggingface-hub[hf_xet]",
 #   "imagehash",
 #   "pillow",
@@ -855,7 +855,7 @@ def build_gui():
             return f'已打开 {p}'
         return f'目录不存在: {p}'
 
-    with gr.Blocks(title='动漫人物训练集提取器', theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title='动漫人物训练集提取器') as demo:
         gr.Markdown('# 🎨 全自动动漫人物训练集提取器\n'
                     '视频/图片 → 人物检测 → 全身+头部裁剪 → 去重 → CCIP 聚类 → 按角色分类输出\n'
                     '*底层: [imgutils](https://github.com/deepghs/imgutils) detect_person/detect_heads + CCIP b36 + isnetis 分割*')
@@ -916,7 +916,6 @@ def build_gui():
                     open_btn = gr.Button('📂 打开输出目录', scale=1)
             with gr.Column(scale=2):
                 stage_text = gr.Textbox(label='状态', value='阶段: 空闲', interactive=False)
-                progress_bar = gr.Progressbar if hasattr(gr, 'Progressbar') else None
                 prog = gr.Slider(0, 1, value=0, label='进度', interactive=False)
                 log_box = gr.Textbox(label='运行日志', lines=24, max_lines=40, interactive=False)
                 out_msg = gr.Textbox(label='', interactive=False, visible=False)
@@ -939,10 +938,19 @@ def build_gui():
 
 def main():
     # 首次导入 imgutils 时它可能尝试 pip install onnxruntime —— 我们已在依赖里声明, 不会触发
+    import inspect
+    import gradio as gr
     demo = build_gui()
     port = int(os.environ.get('ACE_PORT', '7861'))
-    demo.launch(server_name='127.0.0.1', server_port=port, inbrowser=True,
-                show_api=False, quiet=False)
+    # 兼容 Gradio 4/5 (show_api) 与 Gradio 6+ (footer_links)
+    launch_kwargs = dict(server_name='127.0.0.1', server_port=port,
+                         inbrowser=True, quiet=False)
+    sig = inspect.signature(gr.Blocks.launch)
+    if 'footer_links' in sig.parameters:          # Gradio >= 6
+        launch_kwargs['footer_links'] = ['gradio', 'settings']
+    elif 'show_api' in sig.parameters:            # Gradio 4/5
+        launch_kwargs['show_api'] = False
+    demo.launch(**launch_kwargs)
 
 
 if __name__ == '__main__':
