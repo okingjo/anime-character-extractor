@@ -22,8 +22,15 @@ cd anime-character-extractor
 uv run extractor.py
 ```
 - 首次运行 [uv](https://docs.astral.sh/uv/) 会自动创建隔离环境并安装依赖 (dghs-imgutils / onnxruntime / av / gradio 等), 模型权重首次使用时自动从 HuggingFace 下载并缓存。
+- **所有数据都存放在 repo 目录内, 不占用 C 盘**:
+  - `.venv/` — 虚拟环境 (gradio/imgutils 等所有依赖)
+  - `runtime/uv_cache/` — uv 包下载缓存
+  - `runtime/python/` — uv 管理的 Python 解释器 (通过 启动GUI.bat 的环境变量指定)
+  - `runtime/hf_cache/` — HuggingFace 模型缓存 (CCIP/YOLO/isnetis 权重, 约 1GB)
+  - 手动命令行启动时请先设置环境变量 (启动GUI.bat 已自动设置): `UV_CACHE_DIR`、`UV_PYTHON_INSTALL_DIR`、`HF_HOME`
 - 之后浏览器自动打开 `http://127.0.0.1:7861`。
-- 国内网络如 HF 下载慢, 可先 `set HF_ENDPOINT=https://hf-mirror.com` 再启动。
+- 国内网络如 HF 下载慢, 可在 启动GUI.bat 中取消 `HF_ENDPOINT=https://hf-mirror.com` 一行的注释。
+- 需要 Python 3.11 或 3.12 (uv 会自动下载到 runtime/python, 无需手动安装)。
 
 ### 技术方案 (调研结论)
 
@@ -105,8 +112,15 @@ uv run extractor.py
 ```
 
 - On first run, [uv](https://docs.astral.sh/uv/) automatically creates an isolated virtual environment and installs dependencies (dghs-imgutils / onnxruntime / av / gradio, etc.). Model weights are downloaded from HuggingFace on first use and cached.
+- **Everything stays inside the repo folder — nothing is written to C:**
+  - `.venv/` — the virtual environment (all dependencies)
+  - `runtime/uv_cache/` — uv package download cache
+  - `runtime/python/` — uv-managed Python interpreter (set via env vars in `启动GUI.bat`)
+  - `runtime/hf_cache/` — HuggingFace model cache (CCIP/YOLO/isnetis weights, ~1GB)
+  - When launching manually from a terminal, set `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` and `HF_HOME` first (the .bat does this automatically).
 - Your browser then opens `http://127.0.0.1:7861`.
-- If HuggingFace downloads are slow, set `HF_ENDPOINT=https://hf-mirror.com` (or another mirror) before launching.
+- If HuggingFace downloads are slow, uncomment the `HF_ENDPOINT=https://hf-mirror.com` line in `启动GUI.bat` (or use any mirror).
+- Requires Python 3.11 or 3.12 (uv downloads it into runtime/python automatically — no manual install needed).
 
 ### Approach
 

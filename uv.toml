@@ -1,0 +1,5 @@
+# uv 配置: 把包缓存放到 repo 内的 runtime/ 目录, 不占用 C 盘
+# (相对路径基于本文件所在目录解析)
+# 注意: uv 管理的 Python 解释器位置只能通过环境变量 UV_PYTHON_INSTALL_DIR 设置,
+#       已在 启动GUI.bat 中配置为 runtime\python
+cache-dir = "runtime/uv_cache"

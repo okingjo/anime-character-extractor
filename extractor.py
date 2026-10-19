@@ -1,17 +1,3 @@
-# /// script
-# requires-python = ">=3.10,<3.13"
-# dependencies = [
-#   "dghs-imgutils>=0.19.0",
-#   "numpy<2",
-#   "onnxruntime",
-#   "av>=12",
-#   "gradio>=4.44,<6",
-#   "huggingface-hub[hf_xet]",
-#   "imagehash",
-#   "pillow",
-#   "scikit-learn",
-# ]
-# ///
 """
 anime-character-extractor — 全自动动漫人物训练集提取器
 
@@ -24,7 +10,7 @@ anime-character-extractor — 全自动动漫人物训练集提取器
   6. CCIP (ccip-caformer_b36-24, F1 0.941) 特征提取 + 聚类
   7. 按角色输出到文件夹, 过滤出现次数过少的路人簇
 
-启动方式 (无需安装, uv 自动创建隔离环境):
+启动方式 (免安装, uv 在 repo 目录内建隔离环境, 不占用 C 盘):
     uv run extractor.py
 或双击  启动GUI.bat
 """
@@ -40,6 +26,20 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# 所有缓存/模型/环境都放在 repo 目录内 (必须在导入 huggingface 相关库之前设置)
+# ---------------------------------------------------------------------------
+REPO_ROOT = Path(__file__).resolve().parent
+RUNTIME_DIR = REPO_ROOT / 'runtime'
+RUNTIME_DIR.mkdir(exist_ok=True)
+os.environ.setdefault('HF_HOME', str(RUNTIME_DIR / 'hf_cache'))            # HF 模型缓存
+os.environ.setdefault('HF_HUB_CACHE', str(RUNTIME_DIR / 'hf_cache' / 'hub'))
+os.environ.setdefault('XDG_CACHE_HOME', str(RUNTIME_DIR / 'xdg_cache'))     # 其它杂项缓存
+os.environ.setdefault('GRADIO_TEMP_DIR', str(RUNTIME_DIR / 'gradio_tmp'))   # gradio 临时文件
+os.environ.setdefault('UV_CACHE_DIR', str(RUNTIME_DIR / 'uv_cache'))        # uv 包缓存 (对子进程生效)
+os.environ.setdefault('UV_PYTHON_INSTALL_DIR', str(RUNTIME_DIR / 'python')) # uv 管理的 Python
+os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
+
+# ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
 VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.m4v', '.ts', '.mpg', '.mpeg'}
@@ -52,6 +52,15 @@ CCIP_MODELS = {
 }
 CCIP_DEFAULT_MODEL = 'ccip-caformer_b36-24'
 
+# 头部检测模型 (deepghs/anime_head_detection 仓库实际存在的模型)
+HEAD_MODELS = {
+    'head_detect_v2.0_s (默认, 均衡)': 'head_detect_v2.0_s',
+    'head_detect_v2.0_n (最快, 精度略低)': 'head_detect_v2.0_n',
+    'head_detect_v2.0_m (更准, 较慢)': 'head_detect_v2.0_m',
+    'head_detect_v2.0_l (最准, 慢)': 'head_detect_v2.0_l',
+    'head_detect_v1.0_s (旧版)': 'head_detect_v1.0_s',
+}
+
 # 各模型对应的默认聚类参数 (来自 deepghs/ccip_onnx 仓库 metrics)
 # model -> {method: (eps, min_samples)}
 CLUSTER_DEFAULTS = {
@@ -62,6 +71,8 @@ CLUSTER_DEFAULTS = {
     },
     'ccip-caformer-24-randaug-pruned': {
         'dbscan': (0.17847511429108218, 2),
+        'dbscan_2': (0.12921094122454668, 2),
+        'dbscan_free': (0.1291187648928262, 2),
         'optics': (0.5, 5),
         'optics_best': (0.1836453739562513, 5),
     },
@@ -84,22 +95,35 @@ class Params:
     # 抽帧
     frame_interval: float = 1.0        # 秒
     max_frames: int = 3000
-    # 检测
-    person_level: str = 's'
+    # 人物检测 (detect_person)
+    person_version: str = 'v1.1'       # v0 / v1 / v1.1
+    person_level: str = 's'            # n / s / m / x
     person_conf: float = 0.35
+    person_iou: float = 0.5
+    # 头部检测 (detect_heads)
+    head_model: str = 'head_detect_v2.0_s (默认)'
     head_conf: float = 0.4
+    head_iou: float = 0.7
+    # 脸部检测 (detect_faces, 仅降级兜底用)
+    face_version: str = 'v1.4'         # v0 / v1 / v1.3 / v1.4
+    face_level: str = 's'              # n / s
     face_conf: float = 0.3
+    face_iou: float = 0.7
     # 分辨率过滤
     min_body_res: int = 160            # 全身裁剪最短边 px
     min_head_res: int = 80             # 头部裁剪最短边 px
     min_face_res: int = 64             # 降级脸部裁剪最短边 px
+    crop_pad_ratio: float = 0.02       # 裁剪框外扩比例
     # 去重
     dedup_hash_dist: int = 6           # dHash 汉明距离 <= 该值视为重复
-    # 分割
+    # 分割 (isnetis)
     use_segmentation: bool = True      # isnetis 去背景后再提特征
     save_rgba: bool = True             # 输出 RGBA 透明背景图
-    # 聚类
+    seg_min_input_side: int = 480      # 送入 isnetis 前的最小放大边长
+    # CCIP 特征
     ccip_model_label: str = 'ccip-caformer_b36-24 (最强, F1=0.941, 推荐)'
+    ccip_size: int = 384               # 特征提取输入尺寸
+    # 聚类
     cluster_method: str = 'optics_best'
     cluster_eps: float = 0.0           # 0 = 使用模型推荐值
     cluster_min_samples: int = 0       # 0 = 使用模型推荐值
@@ -113,8 +137,13 @@ class Params:
     def ccip_model(self) -> str:
         return CCIP_MODELS.get(self.ccip_model_label, CCIP_DEFAULT_MODEL)
 
+    @property
+    def head_model_name(self) -> str:
+        return HEAD_MODELS.get(self.head_model, 'head_detect_v2.0_s')
+
     def resolved_eps_min_samples(self):
-        defaults = CLUSTER_DEFAULTS.get(self.ccip_model, {}).get(self.cluster_method, (0.5, 5))
+        table = CLUSTER_DEFAULTS.get(self.ccip_model, {})
+        defaults = table.get(self.cluster_method) or table.get('dbscan') or (0.5, 5)
         eps = self.cluster_eps if self.cluster_eps > 0 else defaults[0]
         ms = self.cluster_min_samples if self.cluster_min_samples > 0 else defaults[1]
         return eps, ms
@@ -273,14 +302,16 @@ def process_frame(img, source: str, frame_idx: int, params: Params, logger: Logg
     """对一帧/一张图做检测并生成 Crop 列表 (body / head / face-fallback)."""
     from imgutils.detect import detect_person, detect_heads, detect_faces
     crops = []
+    pad = params.crop_pad_ratio
     try:
-        persons = detect_person(img, level=params.person_level,
-                                conf_threshold=params.person_conf)
+        persons = detect_person(img, level=params.person_level, version=params.person_version,
+                                conf_threshold=params.person_conf, iou_threshold=params.person_iou)
     except Exception as e:
         logger.log(f'  person检测失败({source}#{frame_idx}): {e}')
         persons = []
     try:
-        heads = detect_heads(img, conf_threshold=params.head_conf)
+        heads = detect_heads(img, model_name=params.head_model_name,
+                             conf_threshold=params.head_conf, iou_threshold=params.head_iou)
     except Exception as e:
         logger.log(f'  head检测失败({source}#{frame_idx}): {e}')
         heads = []
@@ -296,7 +327,7 @@ def process_frame(img, source: str, frame_idx: int, params: Params, logger: Logg
         group_key = f'{source}#{frame_idx}#p{pi}'
         # ---- body ----
         if _min_side(pbox) >= params.min_body_res:
-            c = _crop(img, pbox)
+            c = _crop(img, pbox, pad)
             if c:
                 crop_img, real_box = c
                 crops.append(Crop('body', source, frame_idx, real_box, crop_img, group_key=group_key))
@@ -305,7 +336,7 @@ def process_frame(img, source: str, frame_idx: int, params: Params, logger: Logg
             hbox = heads_inside[0]
             used_head_boxes.append(hbox)
             if _min_side(hbox) >= params.min_head_res:
-                c = _crop(img, hbox)
+                c = _crop(img, hbox, pad)
                 if c:
                     crop_img, real_box = c
                     crops.append(Crop('head', source, frame_idx, real_box, crop_img, group_key=group_key))
@@ -319,12 +350,12 @@ def process_frame(img, source: str, frame_idx: int, params: Params, logger: Logg
             continue
         group_key = f'{source}#{frame_idx}#h{hbox[0]}_{hbox[1]}'
         if _min_side(hbox) >= params.min_head_res:
-            c = _crop(img, hbox)
+            c = _crop(img, hbox, pad)
             if c:
                 crop_img, real_box = c
                 crops.append(Crop('head_only', source, frame_idx, real_box, crop_img, group_key=group_key))
         elif _min_side(hbox) >= params.min_face_res:
-            c = _crop(img, hbox)
+            c = _crop(img, hbox, pad)
             if c:
                 crop_img, real_box = c
                 crops.append(Crop('face', source, frame_idx, real_box, crop_img, group_key=group_key))
@@ -332,12 +363,13 @@ def process_frame(img, source: str, frame_idx: int, params: Params, logger: Logg
     # ---- head 检测不到但 person 也没有 => 尝试 face 兜底 ----
     if not crops and not persons:
         try:
-            faces = detect_faces(img, conf_threshold=params.face_conf)
+            faces = detect_faces(img, level=params.face_level, version=params.face_version,
+                             conf_threshold=params.face_conf, iou_threshold=params.face_iou)
         except Exception:
             faces = []
         for fi, (fbox, _, fconf) in enumerate(faces):
             if _min_side(fbox) >= params.min_face_res:
-                c = _crop(img, fbox)
+                c = _crop(img, fbox, pad)
                 if c:
                     crop_img, real_box = c
                     crops.append(Crop('face', source, frame_idx, real_box, crop_img,
@@ -539,7 +571,7 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
         for i, c in enumerate(total_crops):
             if stop_event.is_set():
                 break
-            rgba = segment_crop(c.image)
+            rgba = segment_crop(c.image, min_input_side=params.seg_min_input_side)
             if rgba is not None:
                 c.seg_image = rgba
             else:
@@ -565,7 +597,7 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
         else:
             img_for_feat = c.image
         try:
-            c.feature = ccip_extract_feature(img_for_feat, model=params.ccip_model)
+            c.feature = ccip_extract_feature(img_for_feat, size=params.ccip_size, model=params.ccip_model)
         except Exception as e:
             logger.log(f'  特征提取失败, 跳过该裁剪: {e}')
             c.feature = None
@@ -720,7 +752,7 @@ def _save_group(members, dest: Path, params: Params, logger: Logger):
 # GUI
 # ---------------------------------------------------------------------------
 PARAM_HELP = """
-### 参数说明 (悬停/展开查看)
+### 参数说明 (每项都含推荐值与调大/调小效果)
 
 **输入**
 - **输入路径**: 视频文件、视频文件夹、图片文件夹均可, 自动识别(文件夹会递归搜索)。
@@ -730,33 +762,49 @@ PARAM_HELP = """
 - **抽帧间隔(秒)** `推荐 0.5~1.0` — 每隔多少秒取一帧。调小→样本更多更密、速度慢、重复多; 调大→速度快但可能漏掉出场少的角色。
 - **单视频最大帧数** `推荐 3000` — 保护上限, 超长视频防止处理时间失控。
 
-**检测**
-- **人物检测置信度** `推荐 0.35` — 调低→召回更多人物(含误检); 调高→更干净但漏检远景/遮挡角色。
-- **头部检测置信度** `推荐 0.40` — 同上, 作用于头部裁剪。
+**人物检测 (detect_person, YOLOv8)**
+- **人物检测模型版本** `推荐 v1.1` — v1.1 在 AniDet3+v1.1 混合数据集上训练, 动画截图和插画都较好; v0/v1 为旧数据集。
 - **人物检测模型规格** `推荐 s` — n/s/m/x, 越大越准越慢(s 与 m 差距不大, x 明显慢)。
+- **人物检测置信度** `推荐 0.35` — 调低→召回更多人物(含误检); 调高→更干净但漏检远景/遮挡角色。
+- **人物检测 IoU** `推荐 0.5` — NMS 重叠框合并阈值。调低→去重框更狠(贴近的角色可能被合并掉); 调高→保留更多重叠框(同一人可能出双框)。
 
-**分辨率过滤**
+**头部检测 (detect_heads, YOLO)**
+- **头部检测模型** `推荐 v2.0_s` — n 最快, s 均衡, m/l 更准更慢; v1.0 为旧版。
+- **头部检测置信度** `推荐 0.40` — 调低→更多头部候选(误检↑); 调高→漏掉侧脸/遮挡头。
+- **头部检测 IoU** `推荐 0.7` — 同人物 IoU, 作用于头部框 NMS。
+
+**脸部检测 (detect_faces, 仅"只有脸可见"降级兜底时使用)**
+- **脸部检测版本/规格** `推荐 v1.4 / s` — v1.4 最新; n 更快精度略低。
+- **脸部检测置信度** `推荐 0.30` — 只在降级路径生效。
+- **脸部检测 IoU** `推荐 0.7`。
+
+**分辨率过滤与裁剪**
 - **全身裁剪最小边长(px)** `推荐 160` — 裁剪框最短边小于该值则丢弃。调大→训练集质量高但数量少; 调小→数量多但混入远景小人。
-- **头部裁剪最小边长(px)** `推荐 80`
-- **脸部降级裁剪最小边长(px)** `推荐 64` — 仅当画面中检测不到全身、只有头/脸可见时才使用。
+- **头部裁剪最小边长(px)** `推荐 80` — 达不到即丢弃该头部裁剪(不影响全身)。
+- **脸部降级裁剪最小边长(px)** `推荐 64` — 仅当画面检测不到全身、只有头/脸可见时使用。
+- **裁剪外扩比例** `推荐 0.02` — 检测框向外扩的比例, 保留少量边缘(头发/饰品)。调大→上下文多但可能带入旁人; 0=严格贴框。
 
 **去重**
 - **dHash 去重距离** `推荐 6` — 感知哈希汉明距离≤该值视为重复帧丢弃。调大→去重更狠(可能误删相似姿势的不同图); 调小→保留更多(近似静止镜头会留很多重复); -1=关闭去重。
 
-**分割**
-- **isnetis 去背景** `推荐 开` — 抠掉背景再提特征/保存, 对漫画黑白图、复杂背景显著提升聚类质量; 关闭则更快但背景会干扰 CCIP 特征。
+**分割 (isnetis 动漫抠图)**
+- **isnetis 去背景** `推荐 开` — 抠掉背景再提特征/保存, 对黑白漫画、复杂背景显著提升聚类质量; 关闭则更快但背景干扰 CCIP 特征。
 - **输出 RGBA 透明图** `推荐 开` — 保存为透明背景 PNG(适合 LoRA 训练); 关闭则保存原始裁剪。
+- **分割前最小放大边长** `推荐 480` — 小裁剪先放大到该边长再送 isnetis(小图直接送会得到空 mask)。调大→小图分割更稳但更慢。
 
-**聚类 (CCIP)**
-- **CCIP 模型** `推荐 b36-24` — b36 是官方基准 F1 最高(0.941)的模型; pruned-24 稍快 F1=0.917。
-- **聚类方法** `推荐 optics_best` — optics 对样本量大的场景更稳; dbscan 对 eps 极敏感, 只在角色外观非常规整时用。
-- **eps (邻域半径)** `0=自动(模型推荐值)` — 调大→更多图并入同簇(角色合并风险↑, 簇更完整); 调小→簇更碎(同一角色被拆成多簇)。
-- **min_samples** `0=自动` — OPTICS/DBSCAN 核心点所需邻居数。样本少时(<100张)建议手动降到 2~3, 否则大量图被判为噪声。
+**CCIP 特征**
+- **CCIP 模型** `推荐 b36-24` — b36 官方基准 F1 最高(0.941); pruned-24 稍快 F1=0.917; caformer-6 最轻但精度明显低。
+- **CCIP 输入尺寸** `推荐 384` — 特征提取时的缩放尺寸(模型标准值)。调大无收益且更慢, 调小可能损失细节特征。
+
+**聚类 (CCIP + sklearn)**
+- **聚类方法** `推荐 optics_best` — optics_best/optics 对大样本更稳(eps 取官方调优值); dbscan 对 eps 极敏感, 只建议角色外观规整时用; dbscan_2/dbscan_free 是 imgutils 提供的更严格 eps 预设(簇更碎但更纯)。
+- **eps (邻域半径)** `0=自动(按模型官方推荐)` — 调大→更多图并入同簇(角色合并风险↑); 调小→簇更碎(同一角色拆多簇)。
+- **min_samples** `0=自动` — 核心点所需邻居数。样本少(<100张)时建议手动降到 2~3, 否则大量图被判为噪声(-1 簇)。
 
 **输出过滤**
-- **最小簇张数(路人过滤)** `推荐 8` — 聚类后簇内 body 图少于此数视为路人/噪声, 不输出。调大→只留主要角色; 调小→保留次要角色但混入误检。
-- **每角色最大保留张数** `推荐 400, 0=不限` — 均匀采样截断, 防止某主角刷屏数据集。
-- **保留被拒绝的簇** — 勾选后小簇会存到 `_rejected/` 供人工检查。
+- **最小簇张数(路人过滤)** `推荐 8` — 簇内 body 图少于此数视为路人/噪声不输出。调大→只留主要角色; 调小→保留次要角色但混入误检。
+- **每角色最大保留张数** `推荐 400, 0=不限` — 均匀采样截断, 防止主角刷屏。
+- **保留被拒绝的簇** — 勾选后小簇存到 `_rejected/` 供人工检查。
 
 **输出结构**
 ```
@@ -778,29 +826,36 @@ def build_gui():
     stop_event = threading.Event()
     worker = {'thread': None, 'report': None, 'error': None}
 
-    def do_run(input_path, input_mode, frame_interval, max_frames,
-               person_level, person_conf, head_conf, face_conf,
-               min_body_res, min_head_res, min_face_res,
-               dedup_hash_dist, use_segmentation, save_rgba,
-               ccip_model_label, cluster_method, cluster_eps, cluster_min_samples,
-               min_cluster_count, max_per_character, keep_rejected, output_dir):
+    def do_run(*args):
         if worker['thread'] and worker['thread'].is_alive():
             yield '⚠️ 已有任务在运行中, 请先停止或等待完成。', 0, '', ''
             return
-        params = Params(
-            input_path=input_path, input_mode=input_mode,
-            frame_interval=float(frame_interval), max_frames=int(max_frames),
-            person_level=person_level, person_conf=float(person_conf),
-            head_conf=float(head_conf), face_conf=float(face_conf),
-            min_body_res=int(min_body_res), min_head_res=int(min_head_res),
-            min_face_res=int(min_face_res),
-            dedup_hash_dist=int(dedup_hash_dist),
-            use_segmentation=bool(use_segmentation), save_rgba=bool(save_rgba),
-            ccip_model_label=ccip_model_label, cluster_method=cluster_method,
-            cluster_eps=float(cluster_eps), cluster_min_samples=int(cluster_min_samples),
-            min_cluster_count=int(min_cluster_count), max_per_character=int(max_per_character),
-            keep_rejected=bool(keep_rejected), output_dir=output_dir or '',
-        )
+        keys = ['input_path', 'input_mode', 'output_dir',
+                'frame_interval', 'max_frames',
+                'person_version', 'person_level', 'person_conf', 'person_iou',
+                'head_model', 'head_conf', 'head_iou',
+                'face_version', 'face_level', 'face_conf', 'face_iou',
+                'min_body_res', 'min_head_res', 'min_face_res', 'crop_pad_ratio',
+                'dedup_hash_dist',
+                'use_segmentation', 'save_rgba', 'seg_min_input_side',
+                'ccip_model_label', 'ccip_size',
+                'cluster_method', 'cluster_eps', 'cluster_min_samples',
+                'min_cluster_count', 'max_per_character', 'keep_rejected']
+        raw = dict(zip(keys, args))
+        num = {'frame_interval': float, 'max_frames': int, 'person_conf': float,
+               'person_iou': float, 'head_conf': float, 'head_iou': float,
+               'face_conf': float, 'face_iou': float, 'min_body_res': int,
+               'min_head_res': int, 'min_face_res': int, 'crop_pad_ratio': float,
+               'dedup_hash_dist': int, 'seg_min_input_side': int, 'ccip_size': int,
+               'cluster_eps': float, 'cluster_min_samples': int,
+               'min_cluster_count': int, 'max_per_character': int}
+        for k, t in num.items():
+            raw[k] = t(raw[k])
+        for k in ('use_segmentation', 'save_rgba', 'keep_rejected'):
+            raw[k] = bool(raw[k])
+        raw['input_path'] = raw['input_path'] or ''
+        raw['output_dir'] = raw['output_dir'] or ''
+        params = Params(**raw)
         if not params.input_path.strip():
             yield '❌ 请填写输入路径 (视频文件/视频文件夹/图片文件夹)', 0, '', ''
             return
@@ -858,7 +913,7 @@ def build_gui():
     with gr.Blocks(title='动漫人物训练集提取器') as demo:
         gr.Markdown('# 🎨 全自动动漫人物训练集提取器\n'
                     '视频/图片 → 人物检测 → 全身+头部裁剪 → 去重 → CCIP 聚类 → 按角色分类输出\n'
-                    '*底层: [imgutils](https://github.com/deepghs/imgutils) detect_person/detect_heads + CCIP b36 + isnetis 分割*')
+                    '*底层: [imgutils](https://github.com/deepghs/imgutils) detect_person/detect_heads/detect_faces + CCIP + isnetis 分割*')
         with gr.Row():
             with gr.Column(scale=2):
                 input_path = gr.Textbox(label='输入路径 (视频文件 / 视频文件夹 / 图片文件夹, 自动识别)',
@@ -867,43 +922,81 @@ def build_gui():
                 output_dir = gr.Textbox(label='输出目录 (留空=输入目录下自动创建)', placeholder=r'D:\datasets\my_char_set')
                 with gr.Accordion('⚙️ 参数设置 (点开查看说明与推荐值)', open=False):
                     gr.Markdown(PARAM_HELP)
+                    gr.Markdown('**── 抽帧 (仅视频) ──**')
                     with gr.Row():
                         frame_interval = gr.Slider(0.1, 5.0, value=1.0, step=0.1,
                                                    label='抽帧间隔(秒) [推荐0.5~1.0]')
                         max_frames = gr.Slider(100, 20000, value=3000, step=100,
                                                label='单视频最大帧数 [推荐3000]')
+                    gr.Markdown('**── 人物检测 detect_person ──**')
                     with gr.Row():
+                        person_version = gr.Dropdown(['v1.1', 'v1', 'v0'], value='v1.1',
+                                                     label='人物模型版本 [推荐v1.1]')
                         person_level = gr.Dropdown(['n', 's', 'm', 'x'], value='s',
-                                                   label='人物检测模型规格 [推荐s]')
+                                                   label='人物模型规格 [推荐s]')
+                    with gr.Row():
                         person_conf = gr.Slider(0.05, 0.9, value=0.35, step=0.05,
-                                                label='人物检测置信度 [推荐0.35]')
+                                                label='人物置信度 [推荐0.35]')
+                        person_iou = gr.Slider(0.1, 0.95, value=0.5, step=0.05,
+                                               label='人物IoU(NMS) [推荐0.5]')
+                    gr.Markdown('**── 头部检测 detect_heads ──**')
+                    with gr.Row():
+                        head_model = gr.Dropdown(list(HEAD_MODELS.keys()),
+                                                 value=list(HEAD_MODELS.keys())[0],
+                                                 label='头部检测模型 [推荐v2.0_s]')
                         head_conf = gr.Slider(0.05, 0.9, value=0.40, step=0.05,
-                                              label='头部检测置信度 [推荐0.40]')
+                                              label='头部置信度 [推荐0.40]')
+                        head_iou = gr.Slider(0.1, 0.95, value=0.70, step=0.05,
+                                             label='头部IoU(NMS) [推荐0.7]')
+                    gr.Markdown('**── 脸部检测 detect_faces (仅"只有脸可见"降级时用) ──**')
+                    with gr.Row():
+                        face_version = gr.Dropdown(['v1.4', 'v1.3', 'v1', 'v0'], value='v1.4',
+                                                   label='脸部模型版本 [推荐v1.4]')
+                        face_level = gr.Dropdown(['s', 'n'], value='s',
+                                                 label='脸部模型规格 [推荐s]')
+                    with gr.Row():
                         face_conf = gr.Slider(0.05, 0.9, value=0.30, step=0.05,
-                                              label='脸部检测置信度(仅降级用) [推荐0.30]')
+                                              label='脸部置信度 [推荐0.30]')
+                        face_iou = gr.Slider(0.1, 0.95, value=0.70, step=0.05,
+                                             label='脸部IoU(NMS) [推荐0.7]')
+                    gr.Markdown('**── 分辨率过滤与裁剪 ──**')
                     with gr.Row():
                         min_body_res = gr.Slider(64, 512, value=160, step=8,
-                                                 label='全身裁剪最小边长px [推荐160]')
+                                                 label='全身最小边长px [推荐160]')
                         min_head_res = gr.Slider(32, 256, value=80, step=4,
-                                                 label='头部裁剪最小边长px [推荐80]')
+                                                 label='头部最小边长px [推荐80]')
+                    with gr.Row():
                         min_face_res = gr.Slider(32, 256, value=64, step=4,
-                                                 label='脸部降级裁剪最小边长px [推荐64]')
+                                                 label='脸部降级最小边长px [推荐64]')
+                        crop_pad_ratio = gr.Slider(0.0, 0.2, value=0.02, step=0.01,
+                                                   label='裁剪外扩比例 [推荐0.02]')
+                    gr.Markdown('**── 去重 / 分割 isnetis ──**')
                     with gr.Row():
                         dedup_hash_dist = gr.Slider(-1, 16, value=6, step=1,
                                                     label='dHash去重距离(-1=关闭) [推荐6]')
+                        seg_min_input_side = gr.Slider(256, 1024, value=480, step=32,
+                                                       label='分割前最小放大边长 [推荐480]')
+                    with gr.Row():
                         use_segmentation = gr.Checkbox(value=True, label='isnetis去背景 [推荐开]')
                         save_rgba = gr.Checkbox(value=True, label='输出RGBA透明PNG [推荐开]')
+                    gr.Markdown('**── CCIP 特征与聚类 ──**')
                     with gr.Row():
                         ccip_model_label = gr.Dropdown(list(CCIP_MODELS.keys()),
                                                        value=list(CCIP_MODELS.keys())[0],
                                                        label='CCIP 模型 [推荐b36]')
-                        cluster_method = gr.Dropdown(['optics_best', 'optics', 'dbscan'],
-                                                     value='optics_best', label='聚类方法 [推荐optics_best]')
+                        ccip_size = gr.Dropdown([224, 384, 448, 512], value=384,
+                                                label='CCIP 输入尺寸 [推荐384]')
+                    with gr.Row():
+                        cluster_method = gr.Dropdown(['optics_best', 'optics', 'dbscan',
+                                                      'dbscan_2', 'dbscan_free'],
+                                                     value='optics_best',
+                                                     label='聚类方法 [推荐optics_best]')
                     with gr.Row():
                         cluster_eps = gr.Slider(0.0, 0.5, value=0.0, step=0.005,
                                                 label='eps邻域半径 (0=模型推荐) [推荐0]')
                         cluster_min_samples = gr.Slider(0, 20, value=0, step=1,
                                                         label='min_samples (0=模型推荐, 样本<100时建议2~3)')
+                    gr.Markdown('**── 输出过滤 ──**')
                     with gr.Row():
                         min_cluster_count = gr.Slider(1, 100, value=8, step=1,
                                                       label='最小簇张数-路人过滤 [推荐8]')
@@ -920,14 +1013,20 @@ def build_gui():
                 log_box = gr.Textbox(label='运行日志', lines=24, max_lines=40, interactive=False)
                 out_msg = gr.Textbox(label='', interactive=False, visible=False)
 
+        # 输入顺序必须与 do_run 中 keys 一致
         run_btn.click(
             fn=do_run,
-            inputs=[input_path, input_mode, frame_interval, max_frames,
-                    person_level, person_conf, head_conf, face_conf,
-                    min_body_res, min_head_res, min_face_res,
-                    dedup_hash_dist, use_segmentation, save_rgba,
-                    ccip_model_label, cluster_method, cluster_eps, cluster_min_samples,
-                    min_cluster_count, max_per_character, keep_rejected, output_dir],
+            inputs=[input_path, input_mode, output_dir,
+                    frame_interval, max_frames,
+                    person_version, person_level, person_conf, person_iou,
+                    head_model, head_conf, head_iou,
+                    face_version, face_level, face_conf, face_iou,
+                    min_body_res, min_head_res, min_face_res, crop_pad_ratio,
+                    dedup_hash_dist,
+                    use_segmentation, save_rgba, seg_min_input_side,
+                    ccip_model_label, ccip_size,
+                    cluster_method, cluster_eps, cluster_min_samples,
+                    min_cluster_count, max_per_character, keep_rejected],
             outputs=[log_box, prog, stage_text, out_msg],
         )
         stop_btn.click(fn=do_stop, outputs=[stage_text])

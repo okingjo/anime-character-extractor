@@ -1,0 +1,16 @@
+[project]
+name = "anime-character-extractor"
+version = "1.1.0"
+description = "全自动动漫人物训练集提取器 / Fully automatic anime character dataset extractor"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "dghs-imgutils>=0.19.0",
+    "numpy<2",
+    "onnxruntime",
+    "av>=12",
+    "gradio>=4.44,<6",
+    "huggingface-hub[hf_xet]",
+    "imagehash",
+    "pillow",
+    "scikit-learn",
+]
