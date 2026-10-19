@@ -17,3 +17,7 @@ output/
 
 # 模型缓存
 *.onnx
+gpu_test2.log
+test_warmup.py
+warmup_test.log
+dll_test.log

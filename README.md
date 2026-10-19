@@ -88,8 +88,18 @@ GUI 内每个参数都有推荐值与调大/调小效果说明:
 
 ### 性能参考
 
-- CCIP b36 特征提取 (CPU): ~0.6s/张; 如需 CUDA 加速可把依赖里的 `onnxruntime` 换成 `onnxruntime-gpu` (需 CUDA12+cuDNN9)。
-- 检测阶段约占 60% 时间。1 小时番剧 @1s 间隔 ≈ 3600 帧, 全流程预计 1~3 小时 (CPU)。
+- **GPU 加速 (NVIDIA, 推荐)**: `启动GUI.bat` 检测到 nvidia-smi 会自动 `uv sync --extra gpu`; 手动启用: `uv sync --extra gpu`。无需安装 CUDA Toolkit (依赖里带 pip 版 cublas/cudnn/cufft 运行库)。RTX 5090 实测:
+
+| 阶段 | CPU | GPU | 加速比 |
+|---|---|---|---|
+| CCIP b36 特征提取 | ~640ms/张 | ~25-37ms/张 | **~17-25x** |
+| detect_person 检测 | ~350ms/张 | ~32ms/张 | **~11x** |
+| isnetis 分割 | ~600ms/张 | ~61ms/张 | **~10x** |
+| 全流程 E2E 示例 (66裁剪) | ~157s | ~19s | **~8x** |
+
+- 首次运行每个模型有 5~10s 的 CUDA 初始化 (已用 cuDNN HEURISTIC 卷积搜索把 CCIP warmup 从 ~100s 压到 ~6s)。
+- 想强制 CPU: `set ONNX_MODE=cpu` 后再启动。
+- 检测阶段约占 60% 时间。1 小时番剧 @1s 间隔 ≈ 3600 帧: CPU 预计 1~3 小时, GPU 预计 10~25 分钟。
 
 ### 已知限制
 
@@ -178,8 +188,18 @@ Every parameter in the GUI shows a recommended value plus the effect of increasi
 
 ### Performance
 
-- CCIP b36 feature extraction (CPU): ~0.6s/image. For CUDA acceleration, swap `onnxruntime` for `onnxruntime-gpu` in the dependency list (requires CUDA 12 + cuDNN 9).
-- Detection accounts for ~60% of total time. A 1-hour episode @1s interval ≈ 3600 frames; expect 1–3 hours end-to-end on CPU.
+- **GPU acceleration (NVIDIA, recommended)**: `启动GUI.bat` auto-detects nvidia-smi and runs `uv sync --extra gpu`; manual: `uv sync --extra gpu`. No CUDA Toolkit install needed (pip-provided cublas/cudnn/cufft runtime DLLs are bundled as dependencies). Measured on RTX 5090:
+
+| Stage | CPU | GPU | Speedup |
+|---|---|---|---|
+| CCIP b36 feature extraction | ~640ms/img | ~25-37ms/img | **~17-25x** |
+| detect_person | ~350ms/img | ~32ms/img | **~11x** |
+| isnetis segmentation | ~600ms/img | ~61ms/img | **~10x** |
+| Full E2E sample (66 crops) | ~157s | ~19s | **~8x** |
+
+- Each model has a 5–10s CUDA init on first use (cuDNN HEURISTIC conv search cuts CCIP warmup from ~100s to ~6s).
+- Force CPU: `set ONNX_MODE=cpu` before launching.
+- Detection accounts for ~60% of total time. A 1-hour episode @1s interval ≈ 3600 frames: expect 1–3 hours on CPU, 10–25 minutes on GPU.
 
 ### Known Limitations
 

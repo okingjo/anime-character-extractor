@@ -1,16 +1,30 @@
 [project]
 name = "anime-character-extractor"
-version = "1.1.0"
+version = "1.2.0"
 description = "全自动动漫人物训练集提取器 / Fully automatic anime character dataset extractor"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "dghs-imgutils>=0.19.0",
     "numpy<2",
-    "onnxruntime",
+    # 默认 CPU 版; 启用 gpu extra 时由 onnxruntime-gpu 取代 (两者不能共存)
+    "onnxruntime; extra != 'gpu'",
     "av>=12",
     "gradio>=4.44,<6",
     "huggingface-hub[hf_xet]",
     "imagehash",
     "pillow",
     "scikit-learn",
+]
+
+[project.optional-dependencies]
+# GPU 加速 (NVIDIA, CUDA 12): uv sync --extra gpu
+# 含 pip 版 cublas/cudnn 运行时 DLL, 无需安装完整 CUDA Toolkit
+# 注意: onnxruntime-gpu>=1.24 的 PyPI 默认 wheel 是 CUDA 13 构建, 必须锁 1.23.x (CUDA 12)
+gpu = [
+    "onnxruntime-gpu>=1.22,<1.24",
+    "nvidia-cublas-cu12>=12.9",
+    "nvidia-cudnn-cu12>=9.8",
+    "nvidia-cuda-runtime-cu12>=12.9",
+    "nvidia-cuda-nvrtc-cu12>=12.9",
+    "nvidia-cufft-cu12>=11",
 ]

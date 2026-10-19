@@ -39,6 +39,52 @@ os.environ.setdefault('UV_CACHE_DIR', str(RUNTIME_DIR / 'uv_cache'))        # uv
 os.environ.setdefault('UV_PYTHON_INSTALL_DIR', str(RUNTIME_DIR / 'python')) # uv 管理的 Python
 os.environ.setdefault('HF_HUB_DISABLE_SYMLINKS_WARNING', '1')
 
+
+def _setup_gpu_dll_dirs():
+    """Windows + onnxruntime-gpu: 把 pip 安装的 nvidia cublas/cudnn/cufft DLL 目录
+    注册进 DLL 搜索路径, 否则 CUDAExecutionProvider 创建失败并静默回退 CPU."""
+    if os.name != 'nt':
+        return
+    try:
+        import glob
+        import sysconfig
+        sp = sysconfig.get_paths()['purelib']  # 正确的 site-packages 路径
+        for d in glob.glob(os.path.join(sp, 'nvidia', '*', 'bin')):
+            os.add_dll_directory(d)
+            os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+    except Exception:
+        pass
+
+
+_setup_gpu_dll_dirs()
+
+
+def _patch_onnx_cuda_options():
+    """给 imgutils 的 ONNX session 注入 CUDA provider options:
+    - cudnn_conv_algo_search=HEURISTIC: 默认 EXHAUSTIVE 会对每种输入尺寸穷举搜索卷积算法,
+      首次 warmup 高达 ~100s; HEURISTIC 降到 ~6s 且稳态推理略快 (实测 37ms -> 25ms/张).
+    - arena_extend_strategy=kSameAsRequested: 防止显存 arena 过度扩张.
+    CPU-only 环境下为无操作."""
+    try:
+        import imgutils.utils.onnxruntime as iort
+        from onnxruntime import InferenceSession, SessionOptions, GraphOptimizationLevel
+
+        def _open_patched(ckpt, provider, use_cpu=True):
+            opts = SessionOptions()
+            opts.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+            if provider == 'CPUExecutionProvider':
+                opts.intra_op_num_threads = os.cpu_count()
+                providers = [provider]
+            else:
+                providers = [(provider, {'cudnn_conv_algo_search': 'HEURISTIC',
+                                         'arena_extend_strategy': 'kSameAsRequested'}),
+                             'CPUExecutionProvider']
+            return InferenceSession(ckpt, opts, providers=providers)
+
+        iort._open_onnx_model = _open_patched
+    except Exception:
+        pass  # CPU-only 或版本差异时不影响主流程
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -480,7 +526,21 @@ def cluster_crops(crops, params: Params, logger: Logger):
 def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
     import numpy as np
     from PIL import Image
+    _patch_onnx_cuda_options()  # GPU: 注入 HEURISTIC 卷积搜索, 大幅缩短 warmup
     from imgutils.metrics import ccip_extract_feature
+
+    # 报告当前使用的推理后端
+    try:
+        from imgutils.utils.onnxruntime import get_onnx_provider
+        import onnxruntime as ort
+        active = get_onnx_provider()
+        logger.log(f'ONNX 推理后端: {active} (onnxruntime {ort.__version__})')
+        if active == 'CPUExecutionProvider' and 'CUDAExecutionProvider' in ort.get_available_providers():
+            logger.log('提示: 检测到 CUDA 可用但未启用, 请确认已 uv sync --extra gpu')
+        elif active == 'CPUExecutionProvider':
+            logger.log('提示: 当前为 CPU 推理。NVIDIA 显卡可执行 `uv sync --extra gpu` 启用 GPU 加速 (约10~17倍)')
+    except Exception:
+        pass
 
     t_start = time.time()
     input_path = Path(params.input_path.strip().strip('"'))
