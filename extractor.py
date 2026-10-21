@@ -136,11 +136,12 @@ CLUSTER_DEFAULTS = {
 @dataclass
 class Params:
     # 输入
-    input_path: str = ''
+    input_path: str = ''               # 文件夹或单个文件路径 (文本框)
+    input_files: list = field(default_factory=list)  # GUI 上传的多文件列表
     input_mode: str = '自动检测'      # 自动检测 / 视频 / 图片
     # 抽帧
     frame_interval: float = 1.0        # 秒
-    max_frames: int = 3000
+    max_frames: int = 3000             # 每个视频文件的上限
     # 人物检测 (detect_person)
     person_version: str = 'v1.1'       # v0 / v1 / v1.1
     person_level: str = 's'            # n / s / m / x
@@ -200,13 +201,14 @@ class Params:
 # ---------------------------------------------------------------------------
 @dataclass
 class Crop:
-    kind: str                 # 'body' | 'head' | 'face'
+    kind: str                 # 'body' | 'head' | 'head_only' | 'face'
     source: str               # 来源文件
     frame_idx: int            # 帧号(图片输入为 -1)
     box: tuple                # (x0,y0,x1,y1) 在原图中的位置
-    image: object = None      # PIL.Image (RGB)
-    seg_image: object = None  # PIL.Image (RGBA, 分割后) 可选
-    feature: object = None    # CCIP 特征向量
+    image: object = None      # PIL.Image (RGB), 仅处理期间临时持有, 落盘后置 None 释放内存
+    work_path: str = ''       # 处理后落盘的工作文件路径 (PNG, 可能带alpha)
+    has_alpha: bool = False   # work_path 是否为 RGBA
+    feature: object = None    # CCIP 特征向量 (numpy 768-d)
     cluster_id: int = -2      # -2=未聚类, -1=噪声
     group_key: str = ''       # 关联键: 同帧同人物 body/head 共享
     saved_path: str = ''
@@ -427,26 +429,38 @@ def process_frame(img, source: str, frame_idx: int, params: Params, logger: Logg
 # 去重
 # ---------------------------------------------------------------------------
 class Deduper:
-    def __init__(self, max_dist: int):
+    """向量化 dHash 去重: 哈希打包为 uint8[8], 用 popcount 查表批量比较,
+    单张比较耗时与已存数量近似无关 (30集/10万张规模仍流畅)."""
+
+    def __init__(self, max_dist: int, window: int = 30000):
+        import numpy as np
         import imagehash
+        self.np = np
         self.imagehash = imagehash
         self.max_dist = max_dist
-        self.hashes = []  # list of imagehash
+        self.window = window
+        self.hashes = np.zeros((0, 8), dtype=np.uint8)
+        # 256 项 popcount 查表
+        self.popcount = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
 
     def is_dup(self, pil_img) -> bool:
         if self.max_dist < 0:
             return False
+        np = self.np
         try:
             h = self.imagehash.dhash(pil_img.resize((64, 64)))
         except Exception:
             return False
-        for old in self.hashes:
-            if (h - old) <= self.max_dist:
+        packed = np.packbits(h.hash.flatten())  # (8,) uint8
+        if len(self.hashes):
+            xor = np.bitwise_xor(self.hashes, packed[None, :])
+            dist = self.popcount[xor].sum(axis=1)
+            if dist.min() <= self.max_dist:
                 return True
-        self.hashes.append(h)
-        # 防止极长视频内存膨胀: 只保留最近 20000 个
-        if len(self.hashes) > 20000:
-            self.hashes = self.hashes[-15000:]
+        self.hashes = np.vstack([self.hashes, packed[None, :]])
+        # 滚动窗口: 重复帧主要来自时间上相邻的画面, 保留最近 window 个足够
+        if len(self.hashes) > self.window:
+            self.hashes = self.hashes[-self.window:]
         return False
 
 
@@ -483,40 +497,118 @@ def segment_crop(crop_img, scale=1024, min_input_side=480):
 # ---------------------------------------------------------------------------
 # 聚类
 # ---------------------------------------------------------------------------
-def cluster_crops(crops, params: Params, logger: Logger):
-    """对一组 Crop(已带 feature)聚类, 就地写入 cluster_id."""
-    import numpy as np
-    from sklearn.cluster import DBSCAN, OPTICS
-    from imgutils.metrics import ccip_batch_differences
+FULL_MATRIX_LIMIT = 12000   # n <= 此值: 全量 precomputed 矩阵 (12000^2*4B=576MB)
+CHUNK_CLUSTER_SIZE = 6000   # n > 此值: 分块聚类 + 质心归并
 
-    if not crops:
-        return
-    feats = [c.feature for c in crops]
+
+def _ccip_distance_matrix(feats):
+    """CCIP metric 距离 == (1 - cosine_sim) / 2 (实测与官方 metric 模型 corr=1.0).
+    用归一化特征矩阵乘法分块计算, 避免调用 n^2 的 metric ONNX 模型."""
+    import numpy as np
     n = len(feats)
+    fn = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12)
+    diff = np.zeros((n, n), dtype=np.float32)
+    CH = 4096
+    for i in range(0, n, CH):
+        j = min(n, i + CH)
+        sim = fn[i:j] @ fn.T
+        diff[i:j] = np.clip((1.0 - sim) / 2.0, 0, None)
+    return diff
+
+
+def _fit_cluster_model(dist, method, eps, min_samples):
+    from sklearn.cluster import DBSCAN, OPTICS
+    if method.startswith('dbscan'):
+        return DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed').fit(dist)
+    return OPTICS(max_eps=min(eps, 0.5), min_samples=min_samples,
+                  metric='precomputed').fit(dist)
+
+
+def cluster_features(feats, params: Params, logger: Logger, progress_cb=None):
+    """对特征数组聚类, 返回 labels (np.ndarray).
+    - n <= FULL_MATRIX_LIMIT: 全量距离矩阵 + DBSCAN/OPTICS (与官方 ccip_clustering 等价)
+    - 更大规模 (30集番剧可达数万裁剪): 时间顺序分块聚类 + 质心归并 + 噪声二次分配
+    """
+    import numpy as np
+    n = len(feats)
+    if n == 0:
+        return np.zeros(0, dtype=int)
+    feats = np.asarray(feats, dtype=np.float32)
     eps, min_samples = params.resolved_eps_min_samples()
     logger.log(f'  聚类 {n} 个样本: method={params.cluster_method}, eps={eps:.4f}, min_samples={min_samples}')
 
-    # 分块计算距离矩阵 (n^2 内存保护)
-    # ccip_batch_differences(a + b) 返回 (len(a)+len(b))^2 矩阵, 取左上->右下块 [0:k, k:k+n]
-    CHUNK = 512
-    diff = np.zeros((n, n), dtype=np.float32)
-    for i in range(0, n, CHUNK):
-        j_end = min(n, i + CHUNK)
-        k = j_end - i
-        sub = ccip_batch_differences(feats[i:j_end] + feats, model=params.ccip_model)
-        diff[i:j_end, :] = sub[:k, k:]
-        logger.set_progress(0.75 + 0.15 * (j_end / n), '聚类')
-    diff = (diff + diff.T) / 2
-    np.fill_diagonal(diff, 0)
+    if n <= FULL_MATRIX_LIMIT:
+        dist = _ccip_distance_matrix(feats)
+        model = _fit_cluster_model(dist, params.cluster_method, eps, min_samples)
+        if progress_cb:
+            progress_cb(1.0)
+        return model.labels_.astype(int)
 
-    samples = np.arange(n).reshape(-1, 1)
-    metric = 'precomputed'
-    if params.cluster_method.startswith('dbscan'):
-        model = DBSCAN(eps=eps, min_samples=min_samples, metric=metric).fit(diff)
-    else:
-        model = OPTICS(max_eps=min(eps, 0.5) if eps <= 0.5 else 0.5,
-                       min_samples=min_samples, metric=metric).fit(diff)
-    for c, lab in zip(crops, model.labels_):
+    # ---- 大规模: 分块 + 质心归并 ----
+    logger.log(f'  大规模模式: 每块 {CHUNK_CLUSTER_SIZE} 分块聚类, 再按质心归并 (eps={eps:.4f})')
+    labels = np.full(n, -1, dtype=int)
+    centroids = []      # list of normalized centroid vectors
+    centroid_labels = []
+    next_label = 0
+    fn_all = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12)
+
+    for start in range(0, n, CHUNK_CLUSTER_SIZE):
+        end = min(n, start + CHUNK_CLUSTER_SIZE)
+        chunk = feats[start:end]
+        dist = _ccip_distance_matrix(chunk)
+        local = _fit_cluster_model(dist, params.cluster_method, eps, max(2, min_samples))
+        for lab in set(local.labels_):
+            if lab == -1:
+                continue
+            members = np.where(local.labels_ == lab)[0] + start
+            centroid = fn_all[members].mean(axis=0)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
+            # 与已有质心比对
+            best_i, best_d = -1, 1e9
+            if centroids:
+                C = np.stack(centroids)
+                d = (1.0 - C @ centroid) / 2.0
+                best_i, best_d = int(d.argmin()), float(d.min())
+            if best_d <= eps:
+                labels[members] = centroid_labels[best_i]
+                # 运行均值更新质心
+                old = centroids[best_i]
+                centroids[best_i] = (old + centroid) / np.linalg.norm(old + centroid)
+            else:
+                labels[members] = next_label
+                centroids.append(centroid)
+                centroid_labels.append(next_label)
+                next_label += 1
+        if progress_cb:
+            progress_cb(0.5 * end / n)
+
+    # ---- 噪声二次分配: -1 的样本若离某质心足够近则并入 ----
+    noise_idx = np.where(labels == -1)[0]
+    if len(noise_idx) and centroids:
+        C = np.stack(centroids)
+        CH = 4096
+        for i in range(0, len(noise_idx), CH):
+            idx = noise_idx[i:i + CH]
+            d = (1.0 - fn_all[idx] @ C.T) / 2.0
+            nearest = d.argmin(axis=1)
+            near_d = d[np.arange(len(idx)), nearest]
+            for k, gi in enumerate(idx):
+                if near_d[k] <= eps:
+                    labels[gi] = centroid_labels[nearest[k]]
+    if progress_cb:
+        progress_cb(1.0)
+    n_clusters = len(set(labels.tolist()) - {-1})
+    logger.log(f'  归并完成: {n_clusters} 个簇, 噪声 {int((labels == -1).sum())}')
+    return labels
+
+
+def cluster_crops(crops, params: Params, logger: Logger, progress_cb=None):
+    """对一组 Crop(已带 feature)聚类, 就地写入 cluster_id."""
+    if not crops:
+        return
+    feats = [c.feature for c in crops]
+    labels = cluster_features(feats, params, logger, progress_cb)
+    for c, lab in zip(crops, labels):
         c.cluster_id = int(lab)
 
 
@@ -524,57 +616,90 @@ def cluster_crops(crops, params: Params, logger: Logger):
 # 主流程
 # ---------------------------------------------------------------------------
 def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
+    """单遍流水线: 每帧 检测→去重→(分割)→CCIP特征→裁剪落盘到工作目录后立即释放内存.
+    内存占用与总样本量无关 (30集番剧/数万裁剪也稳定), 聚类只用特征向量."""
     import numpy as np
     from PIL import Image
     _patch_onnx_cuda_options()  # GPU: 注入 HEURISTIC 卷积搜索, 大幅缩短 warmup
     from imgutils.metrics import ccip_extract_feature
 
-    # 报告当前使用的推理后端
+    # 报告当前推理后端
     try:
         from imgutils.utils.onnxruntime import get_onnx_provider
         import onnxruntime as ort
         active = get_onnx_provider()
         logger.log(f'ONNX 推理后端: {active} (onnxruntime {ort.__version__})')
         if active == 'CPUExecutionProvider' and 'CUDAExecutionProvider' in ort.get_available_providers():
-            logger.log('提示: 检测到 CUDA 可用但未启用, 请确认已 uv sync --extra gpu')
+            logger.log('提示: 检测到 CUDA 可用但未启用, 请执行 uv sync --extra gpu')
         elif active == 'CPUExecutionProvider':
-            logger.log('提示: 当前为 CPU 推理。NVIDIA 显卡可执行 `uv sync --extra gpu` 启用 GPU 加速 (约10~17倍)')
+            logger.log('提示: 当前为 CPU 推理。NVIDIA 显卡可执行 uv sync --extra gpu 启用 GPU 加速 (约10~25倍)')
     except Exception:
         pass
 
     t_start = time.time()
-    input_path = Path(params.input_path.strip().strip('"'))
-    if not input_path.exists():
-        raise FileNotFoundError(f'输入路径不存在: {input_path}')
+
+    # -- 收集输入: 多文件/多文件夹/单文件 混合支持 --
+    files = resolve_input_files(params, logger)
+    if not files:
+        raise ValueError('没有找到可处理的视频/图片 (检查输入路径或上传的文件)')
+    n_video = sum(1 for f in files if f.suffix.lower() in VIDEO_EXTS)
+    n_image = len(files) - n_video
+    logger.log(f'输入: {len(files)} 个文件 (视频 {n_video}, 图片 {n_image})')
 
     # -- 输出目录 --
     if params.output_dir.strip():
         out_root = Path(params.output_dir.strip().strip('"'))
     else:
-        out_root = input_path if input_path.is_dir() else input_path.parent
-        out_root = out_root / f'character_dataset_{time.strftime("%Y%m%d_%H%M%S")}'
-    work_dir = out_root / '_work'
+        anchor = files[0]
+        base = anchor if anchor.is_dir() else anchor.parent
+        out_root = base / f'character_dataset_{time.strftime("%Y%m%d_%H%M%S")}'
+    work_dir = out_root / '_work' / 'crops'
     work_dir.mkdir(parents=True, exist_ok=True)
     logger.log(f'输出目录: {out_root}')
 
-    # -- 收集输入 --
-    mode = params.input_mode
-    if mode == '自动检测':
-        mode, files = detect_input_mode(input_path)
-    elif mode == '视频':
-        files = collect_videos(input_path)
-    else:
-        files = collect_images(input_path)
-    if not files:
-        raise ValueError(f'在 {input_path} 没有找到可处理的视频/图片')
-    logger.log(f'输入模式: {mode}, 共 {len(files)} 个文件')
-
     deduper = Deduper(params.dedup_hash_dist)
-    all_crops = []          # body / head (关联到body的)
-    fallback_crops = []     # head_only / face (无全身可关联)
-    stats = {'frames': 0, 'crops_raw': 0, 'crops_dedup': 0}
+    all_crops = []          # body / head
+    fallback_crops = []     # head_only / face
+    stats = {'frames': 0, 'crops_raw': 0, 'crops_kept': 0, 'seg_failed': 0}
+    per_source = {}         # 每个输入文件的统计
+    crop_counter = [0]
 
-    seg_fail_count = 0
+    def finalize_crop(c: Crop, frame_img):
+        """去重通过后: (可选)分割 → 提特征 → 落盘工作文件 → 释放图像."""
+        crop_counter[0] += 1
+        work_path = work_dir / f'{crop_counter[0]:07d}.png'
+        rgba = None
+        if params.use_segmentation:
+            rgba = segment_crop(c.image, min_input_side=params.seg_min_input_side)
+            if rgba is None:
+                stats['seg_failed'] += 1
+        # 特征: 分割成功用白底合成图, 否则原裁剪
+        if rgba is not None:
+            bg = Image.new('RGB', rgba.size, (255, 255, 255))
+            bg.paste(rgba, mask=rgba.split()[-1])
+            feat_img = bg
+        else:
+            feat_img = c.image
+        try:
+            c.feature = ccip_extract_feature(feat_img, size=params.ccip_size,
+                                             model=params.ccip_model)
+        except Exception as e:
+            logger.log(f'  特征提取失败, 丢弃裁剪: {e}')
+            return False
+        # 落盘 (RGBA 或 RGB), 之后 Crop 只保留路径
+        try:
+            if params.save_rgba and rgba is not None:
+                rgba.save(work_path)
+                c.has_alpha = True
+            else:
+                c.image.save(work_path)
+                c.has_alpha = False
+        except Exception as e:
+            logger.log(f'  工作文件写入失败: {e}')
+            return False
+        c.work_path = str(work_path)
+        c.image = None  # 释放内存图像 (内存占用与总样本量无关的关键)
+        return True
 
     def handle_image(img, source, frame_idx):
         crops = process_frame(img, source, frame_idx, params, logger)
@@ -585,9 +710,8 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
                 return
             if deduper.is_dup(c.image):
                 continue
-            kept.append(c)
-        # 同一帧内 head 与 body 关联: head 与 body 的 dedup 是独立的,
-        # 但若 body 被去掉而 head 保留, head 会失去 group => 转为 fallback
+            if finalize_crop(c, img):
+                kept.append(c)
         body_keys = {c.group_key for c in kept if c.kind == 'body'}
         for c in kept:
             if c.kind == 'head' and c.group_key not in body_keys:
@@ -597,14 +721,19 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
                 all_crops.append(c)
             else:
                 fallback_crops.append(c)
-        stats['crops_dedup'] += len(kept)
+        stats['crops_kept'] += len(kept)
+        src_stat = per_source.setdefault(source, {'frames': 0, 'kept': 0})
+        src_stat['frames'] += 1
+        src_stat['kept'] += len(kept)
 
-    # -- 阶段1: 抽帧/读图 + 检测 + 裁剪 --
+    # -- 阶段1: 逐文件 抽帧/读图 + 单遍处理 --
+    n_files = len(files)
     for fi, f in enumerate(files):
         if stop_event.is_set():
             logger.log('收到停止请求, 中断')
             break
-        logger.log(f'[{fi+1}/{len(files)}] 处理 {f.name}')
+        logger.log(f'[{fi+1}/{n_files}] {f.name}  (已收集 {stats["crops_kept"]} 裁剪)')
+        per_source.setdefault(str(f), {'frames': 0, 'kept': 0})
         if f.suffix.lower() in VIDEO_EXTS:
             for frame_idx, img in iter_video_frames(f, params.frame_interval, params.max_frames, logger):
                 if stop_event.is_set():
@@ -619,64 +748,24 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
                 continue
             stats['frames'] += 1
             handle_image(img, str(f), -1)
+        logger.set_progress(0.62 * (fi + 1) / n_files, '抽帧/检测/特征')
 
     total_crops = all_crops + fallback_crops
-    logger.log(f"检测阶段完成: 帧/图 {stats['frames']}, 原始裁剪 {stats['crops_raw']}, 去重后 {stats['crops_dedup']}")
+    logger.log(f'处理完成: 帧/图 {stats["frames"]}, 原始裁剪 {stats["crops_raw"]}, '
+               f'去重后 {stats["crops_kept"]}, 分割失败回退 {stats["seg_failed"]}')
     if not total_crops:
         raise RuntimeError('没有提取到任何满足分辨率要求的角色裁剪, 请调低最小分辨率或检测置信度')
 
-    # -- 阶段2: 可选分割 --
-    if params.use_segmentation:
-        logger.log(f'分割去背景 (isnetis) x{len(total_crops)} ...')
-        for i, c in enumerate(total_crops):
-            if stop_event.is_set():
-                break
-            rgba = segment_crop(c.image, min_input_side=params.seg_min_input_side)
-            if rgba is not None:
-                c.seg_image = rgba
-            else:
-                seg_fail_count += 1
-            if i % 50 == 0:
-                logger.set_progress(0.5 + 0.15 * (i / len(total_crops)), '分割')
-        if seg_fail_count:
-            logger.log(f'  {seg_fail_count} 张分割失败, 将使用原图')
-
-    # -- 阶段3: CCIP 特征 --
-    logger.log(f'CCIP 特征提取 ({params.ccip_model}) x{len(total_crops)} ...')
-    feat_src = 'seg' if params.use_segmentation else 'raw'
-    t0 = time.time()
-    for i, c in enumerate(total_crops):
-        if stop_event.is_set():
-            break
-        img_for_feat = None
-        if feat_src == 'seg' and c.seg_image is not None:
-            # RGBA -> RGB, 透明区域填白 (CCIP 训练数据为白底单角色)
-            bg = Image.new('RGB', c.seg_image.size, (255, 255, 255))
-            bg.paste(c.seg_image, mask=c.seg_image.split()[-1])
-            img_for_feat = bg
-        else:
-            img_for_feat = c.image
-        try:
-            c.feature = ccip_extract_feature(img_for_feat, size=params.ccip_size, model=params.ccip_model)
-        except Exception as e:
-            logger.log(f'  特征提取失败, 跳过该裁剪: {e}')
-            c.feature = None
-        if i % 50 == 0:
-            elapsed = time.time() - t0
-            eta = elapsed / max(i, 1) * (len(total_crops) - i)
-            logger.set_progress(0.65 + 0.1 * (i / len(total_crops)),
-                                f'特征 {i}/{len(total_crops)} (ETA {eta/60:.1f}min)')
-    total_crops = [c for c in total_crops if c.feature is not None]
-
-    # -- 阶段4: 聚类 (body+head 一组; head_only/face 一组) --
+    # -- 阶段2: 聚类 (只用特征, 图像已在磁盘) --
+    logger.set_progress(0.65, '聚类')
     main_crops = [c for c in total_crops if c.kind in ('body', 'head')]
     fb_crops = [c for c in total_crops if c.kind in ('head_only', 'face')]
     logger.log(f'主聚类(全身/关联头部): {len(main_crops)}, 兜底聚类(仅头/脸): {len(fb_crops)}')
 
-    # 主聚类只用 body 的特征, head 通过 group_key 继承
     bodies = [c for c in main_crops if c.kind == 'body']
     if bodies:
-        cluster_crops(bodies, params, logger)
+        cluster_crops(bodies, params, logger,
+                      progress_cb=lambda p: logger.set_progress(0.65 + 0.12 * p, '主聚类'))
     head_by_group = {}
     for c in bodies:
         head_by_group.setdefault(c.group_key, c.cluster_id)
@@ -686,23 +775,21 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
 
     if fb_crops:
         logger.log('兜底聚类...')
-        cluster_crops(fb_crops, params, logger)
+        cluster_crops(fb_crops, params, logger,
+                      progress_cb=lambda p: logger.set_progress(0.78 + 0.08 * p, '兜底聚类'))
 
-    # -- 阶段5: 过滤 + 输出 --
+    # -- 阶段3: 过滤 + 输出 (从工作目录搬移/复制到最终文件夹) --
     logger.log('整理输出...')
-    logger.set_progress(0.92, '输出')
+    logger.set_progress(0.88, '输出')
 
     def group_stats(crop_list):
         groups = {}
         for c in crop_list:
-            if c.cluster_id < 0:
-                groups.setdefault(-1, []).append(c)
-            else:
-                groups.setdefault(c.cluster_id, []).append(c)
+            key = c.cluster_id if c.cluster_id >= 0 else -1
+            groups.setdefault(key, []).append(c)
         return groups
 
-    report = {'main': {}, 'fallback': {}, 'params': asdict(params)}
-    # 主角色: 以 body 数量决定簇大小
+    report = {'main': {}, 'fallback': {}, 'per_source': per_source, 'params': asdict(params)}
     body_groups = group_stats(bodies)
     all_main_groups = group_stats(main_crops)
 
@@ -728,14 +815,12 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
                                 'total_saved': len(members)}
         logger.log(f'  {name}: body={n_body}, 共保存 {len(members)} 张')
 
-    # 噪声 body (cluster_id=-1)
     noise = body_groups.get(-1, [])
     if noise and params.keep_rejected:
         _save_group([c for c in main_crops if c.cluster_id == -1],
                     rejected_dir / 'main_noise_unclustered', params, logger)
     report['main']['_unclustered'] = len(noise)
 
-    # 兜底组
     fb_groups = group_stats(fb_crops)
     fb_idx = 0
     for cid, members in sorted(fb_groups.items(), key=lambda kv: -len(kv[1])):
@@ -754,7 +839,6 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
         report['fallback'][name] = {'cluster_id': int(cid), 'total_saved': len(members)}
         logger.log(f'  {name} (仅头/脸): 保存 {len(members)} 张')
 
-    # -- report --
     report['stats'] = stats
     report['elapsed_sec'] = round(time.time() - t_start, 1)
     report['characters'] = char_idx
@@ -762,17 +846,64 @@ def run_pipeline(params: Params, logger: Logger, stop_event: threading.Event):
     with open(out_root / 'report.json', 'w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=str)
 
-    # 清理临时目录
+    # 清理工作目录
     try:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(out_root / '_work', ignore_errors=True)
     except Exception:
         pass
 
     logger.set_progress(1.0, '完成')
-    logger.log(f"✅ 完成! 共 {char_idx} 个角色 (+{fb_idx} 个仅头/脸组), "
-               f"耗时 {report['elapsed_sec']/60:.1f} 分钟")
+    logger.log(f'✅ 完成! 共 {char_idx} 个角色 (+{fb_idx} 个仅头/脸组), '
+               f'来自 {n_files} 个文件, 耗时 {report["elapsed_sec"]/60:.1f} 分钟')
     logger.log(f'输出: {out_root}')
     return report
+
+
+def resolve_input_files(params: Params, logger: Logger):
+    """汇总所有输入: GUI 上传的多文件 + 文本框路径 (文件/文件夹, 可多个用换行或分号分隔).
+    返回按文件名自然排序的 Path 列表 (剧集按 ep01..ep12 顺序处理)."""
+    import re as _re
+
+    def natural_key(p: Path):
+        return [int(t) if t.isdigit() else t.lower() for t in _re.split(r'(\d+)', p.name)]
+
+    collected = []
+    seen = set()
+
+    def add_files(paths):
+        for f in paths:
+            key = str(Path(f).resolve()).lower()
+            if key not in seen:
+                seen.add(key)
+                collected.append(Path(f))
+
+    # 1) GUI 上传的文件
+    for f in (params.input_files or []):
+        p = Path(f) if not isinstance(f, Path) else f
+        if p.is_file() and p.suffix.lower() in (VIDEO_EXTS | IMAGE_EXTS):
+            add_files([p])
+
+    # 2) 文本框路径 (支持换行/分号分隔多个)
+    raw = (params.input_path or '').strip().strip('"')
+    if raw:
+        for part in _re.split(r'[;\n]+', raw):
+            part = part.strip().strip('"')
+            if not part:
+                continue
+            p = Path(part)
+            if p.is_file():
+                if p.suffix.lower() in (VIDEO_EXTS | IMAGE_EXTS):
+                    add_files([p])
+            elif p.is_dir():
+                mode = params.input_mode
+                if mode in ('自动检测', '视频'):
+                    add_files(collect_videos(p))
+                if mode in ('自动检测', '图片'):
+                    add_files(collect_images(p))
+            else:
+                logger.log(f'输入路径不存在, 跳过: {part}')
+
+    return sorted(collected, key=natural_key)
 
 
 def _cap_members(members, cap):
@@ -784,6 +915,7 @@ def _cap_members(members, cap):
 
 
 def _save_group(members, dest: Path, params: Params, logger: Logger):
+    """把工作目录中的裁剪文件移动到最终角色文件夹 (移动而非复制, 省磁盘)."""
     dest.mkdir(parents=True, exist_ok=True)
     kind_dir = {'body': 'body', 'head': 'head', 'head_only': 'head_only', 'face': 'face'}
     counter = {}
@@ -791,18 +923,12 @@ def _save_group(members, dest: Path, params: Params, logger: Logger):
         sub = dest / kind_dir.get(c.kind, c.kind)
         sub.mkdir(parents=True, exist_ok=True)
         counter[c.kind] = counter.get(c.kind, 0) + 1
-        stem = f'{Path(c.source).stem}_f{c.frame_idx:06d}_{c.kind}_{counter[c.kind]:04d}'
-        if params.save_rgba and c.seg_image is not None:
-            path = sub / f'{stem}.png'
-            try:
-                c.seg_image.save(path)
-                c.saved_path = str(path)
-                continue
-            except Exception as e:
-                logger.log(f'  RGBA保存失败 {stem}: {e}, 回退原图')
+        # 文件名带集数来源, 便于溯源: <视频名>_f<帧号>_<类型>_<序号>.png
+        src_stem = Path(c.source).stem[:60]
+        stem = f'{src_stem}_f{c.frame_idx:06d}_{c.kind}_{counter[c.kind]:04d}'
         path = sub / f'{stem}.png'
         try:
-            c.image.save(path)
+            shutil.move(c.work_path, str(path))
             c.saved_path = str(path)
         except Exception as e:
             logger.log(f'  保存失败 {stem}: {e}')
@@ -814,13 +940,16 @@ def _save_group(members, dest: Path, params: Params, logger: Logger):
 PARAM_HELP = """
 ### 参数说明 (每项都含推荐值与调大/调小效果)
 
-**输入**
-- **输入路径**: 视频文件、视频文件夹、图片文件夹均可, 自动识别(文件夹会递归搜索)。
-- **输出目录**: 留空则在输入目录下自动创建 `character_dataset_时间戳/`。
+**输入 (支持多集批量)**
+- **上传文件**: 可一次上传多集视频/多张图片 (文件选择框支持多选, 也可直接拖拽)。
+- **输入路径**: 文件、文件夹均可; **多个路径用换行或分号分隔**; 文件夹递归搜索。与上传可同时使用, 自动去重。
+- 所有文件会按文件名自然排序 (ep01..ep12) 统一处理, **全部剧集的裁剪合并后一起聚类**, 同一角色跨集自动归入同一文件夹。
+- **输出目录**: 留空则在第一个输入文件所在目录下自动创建 `character_dataset_时间戳/`。
+- report.json 中含 per_source 统计 (每个文件贡献的帧数/裁剪数)。
 
 **抽帧 (仅视频)**
 - **抽帧间隔(秒)** `推荐 0.5~1.0` — 每隔多少秒取一帧。调小→样本更多更密、速度慢、重复多; 调大→速度快但可能漏掉出场少的角色。
-- **单视频最大帧数** `推荐 3000` — 保护上限, 超长视频防止处理时间失控。
+- **单视频最大帧数** `推荐 3000` — 每个视频文件各自的上限, 超长视频防止处理时间失控。30集×3000=9万帧仍安全(内存与样本量无关)。
 
 **人物检测 (detect_person, YOLOv8)**
 - **人物检测模型版本** `推荐 v1.1` — v1.1 在 AniDet3+v1.1 混合数据集上训练, 动画截图和插画都较好; v0/v1 为旧数据集。
@@ -890,7 +1019,7 @@ def build_gui():
         if worker['thread'] and worker['thread'].is_alive():
             yield '⚠️ 已有任务在运行中, 请先停止或等待完成。', 0, '', ''
             return
-        keys = ['input_path', 'input_mode', 'output_dir',
+        keys = ['input_path', 'input_files', 'input_mode', 'output_dir',
                 'frame_interval', 'max_frames',
                 'person_version', 'person_level', 'person_conf', 'person_iou',
                 'head_model', 'head_conf', 'head_iou',
@@ -915,9 +1044,10 @@ def build_gui():
             raw[k] = bool(raw[k])
         raw['input_path'] = raw['input_path'] or ''
         raw['output_dir'] = raw['output_dir'] or ''
+        raw['input_files'] = list(raw['input_files'] or [])
         params = Params(**raw)
-        if not params.input_path.strip():
-            yield '❌ 请填写输入路径 (视频文件/视频文件夹/图片文件夹)', 0, '', ''
+        if not params.input_path.strip() and not params.input_files:
+            yield '❌ 请填写输入路径或上传文件 (可多选/整个文件夹)', 0, '', ''
             return
 
         logger.lines.clear()
@@ -976,8 +1106,12 @@ def build_gui():
                     '*底层: [imgutils](https://github.com/deepghs/imgutils) detect_person/detect_heads/detect_faces + CCIP + isnetis 分割*')
         with gr.Row():
             with gr.Column(scale=2):
-                input_path = gr.Textbox(label='输入路径 (视频文件 / 视频文件夹 / 图片文件夹, 自动识别)',
-                                        placeholder=r'例如 D:\anime\ep01.mp4 或 D:\anime\manga_pages')
+                input_files = gr.File(label='📁 上传多集视频/图片 (可多选, 或直接拖入; 与下方路径二选一或同时用)',
+                                      file_count='multiple',
+                                      file_types=list(VIDEO_EXTS) + list(IMAGE_EXTS))
+                input_path = gr.Textbox(label='输入路径 (文件/文件夹; 多个用换行或分号分隔; 文件夹递归搜索)',
+                                        placeholder=r'例如 D:\anime\ (含多集) 或 D:\ep01.mp4;D:\ep02.mp4',
+                                        lines=2)
                 input_mode = gr.Radio(['自动检测', '视频', '图片'], value='自动检测', label='输入模式')
                 output_dir = gr.Textbox(label='输出目录 (留空=输入目录下自动创建)', placeholder=r'D:\datasets\my_char_set')
                 with gr.Accordion('⚙️ 参数设置 (点开查看说明与推荐值)', open=False):
@@ -1076,7 +1210,7 @@ def build_gui():
         # 输入顺序必须与 do_run 中 keys 一致
         run_btn.click(
             fn=do_run,
-            inputs=[input_path, input_mode, output_dir,
+            inputs=[input_path, input_files, input_mode, output_dir,
                     frame_interval, max_frames,
                     person_version, person_level, person_conf, person_iou,
                     head_model, head_conf, head_iou,

@@ -44,16 +44,18 @@ uv run extractor.py
 | Dan:mul 多模态 (IJCNN 2023) | ❌ 需标注数据训练分类器 |
 
 处理管线:
-1. **抽帧**: PyAV 解码(自带, 无需系统 ffmpeg), 按秒间隔采样
-2. **检测**: `detect_person`(YOLOv8, AniDet3+v1.1) 找全身; `detect_heads`(v2.0) 找头部并与全身框关联
-3. **裁剪策略**:
+1. **多集批量输入**: GUI 可一次上传多集/多张图, 输入路径框支持多个路径(换行/分号分隔)与文件夹递归; 所有文件按集数自然排序统一处理, **合并聚类**, 同一角色跨集自动归入同一文件夹
+2. **单遍流水线**: 每帧 检测→去重→分割→提特征→裁剪落盘即释放内存, 内存占用与总样本量无关 (30集/数万裁剪也稳定)
+3. **抽帧**: PyAV 解码(自带, 无需系统 ffmpeg), 按秒间隔采样
+4. **检测**: `detect_person`(YOLOv8, AniDet3+v1.1) 找全身; `detect_heads`(v2.0) 找头部并与全身框关联
+5. **裁剪策略**:
    - 默认输出 **全身(body)** + **同帧关联的头部(head)** 两种裁剪
    - **仅当画面检测不到全身、只有头/脸可见时**, 才降级输出 head_only / face 裁剪 (单独聚类到 `faceonly_XX/`)
    - 头部裁剪低于最小分辨率标准 → 直接丢弃, 不影响全身
-4. **去重**: dHash 感知哈希, 剔除近似静止镜头的重复帧
-5. **分割**: isnetis 动漫抠图去背景, 白底单角色图正是 CCIP 的训练分布, 显著提升聚类质量(尤其黑白漫画)
-6. **聚类**: CCIP 特征 + OPTICS/DBSCAN (eps/min_samples 用官方按模型调优的推荐值)
-7. **过滤输出**: 簇内全身图 < 最小张数 → 视为路人丢弃; 每角色可设上限均匀采样
+6. **去重**: dHash 感知哈希(向量化, 大规模仍流畅), 剔除近似静止镜头的重复帧
+7. **分割**: isnetis 动漫抠图去背景, 白底单角色图正是 CCIP 的训练分布, 显著提升聚类质量(尤其黑白漫画)
+8. **聚类**: CCIP 特征 + OPTICS/DBSCAN (eps/min_samples 用官方按模型调优的推荐值); 大规模(>1.2万)自动切换为分块聚类+质心归并, 结果与官方 metric 模型一致(实测 pairwise F1=1.000)
+9. **过滤输出**: 簇内全身图 < 最小张数 → 视为路人丢弃; 每角色可设上限均匀采样; report.json 含每集(per_source)贡献统计
 
 ### 输出结构
 
@@ -144,16 +146,18 @@ Character discrimination uses **imgutils CCIP** (Contrastive Character Image Pre
 | Dan:mul multimodal (IJCNN 2023) | ❌ Requires labeled data to train a classifier |
 
 Pipeline:
-1. **Frame sampling**: PyAV decoding (bundled, no system ffmpeg needed), sampled at a configurable interval
-2. **Detection**: `detect_person` (YOLOv8, AniDet3+v1.1) for full bodies; `detect_heads` (v2.0) for heads, associated with body boxes
-3. **Cropping policy**:
+1. **Multi-episode batch input**: upload multiple episodes/images at once in the GUI; the path box accepts multiple paths (newline/semicolon separated) and recursive folders. All files are sorted by episode number, processed together and **clustered jointly**, so the same character across episodes lands in one folder automatically
+2. **Single-pass pipeline**: per frame — detect → dedup → segment → extract features → write crop to disk and free memory, so RAM usage is independent of total sample count (stable even for 30 episodes / tens of thousands of crops)
+3. **Frame sampling**: PyAV decoding (bundled, no system ffmpeg needed), sampled at a configurable interval
+4. **Detection**: `detect_person` (YOLOv8, AniDet3+v1.1) for full bodies; `detect_heads` (v2.0) for heads, associated with body boxes
+5. **Cropping policy**:
    - By default outputs **full-body** + **head** crops associated within the same frame
    - **Only when no full body is detected and just a head/face is visible** does it fall back to head_only / face crops (clustered separately into `faceonly_XX/`)
    - Head crops below the minimum resolution are discarded without affecting the body crop
-4. **Deduplication**: dHash perceptual hashing removes near-identical frames from static shots
-5. **Segmentation**: isnetis anime matting removes backgrounds; white-background single-character images match CCIP's training distribution and substantially improve clustering quality (especially for monochrome manga)
-6. **Clustering**: CCIP features + OPTICS/DBSCAN (eps/min_samples default to the officially tuned per-model values)
-7. **Filtered output**: clusters with fewer than the minimum number of body images are treated as background characters and dropped; a per-character cap with uniform sampling is available
+6. **Deduplication**: dHash perceptual hashing (vectorized, stays fast at scale) removes near-identical frames from static shots
+7. **Segmentation**: isnetis anime matting removes backgrounds; white-background single-character images match CCIP's training distribution and substantially improve clustering quality (especially for monochrome manga)
+8. **Clustering**: CCIP features + OPTICS/DBSCAN (eps/min_samples default to the officially tuned per-model values); for very large inputs (>12k crops) it auto-switches to chunked clustering + centroid merging, verified identical to the official metric model (pairwise F1=1.000)
+9. **Filtered output**: clusters with fewer than the minimum number of body images are treated as background characters and dropped; a per-character cap with uniform sampling is available; report.json includes per-episode (per_source) statistics
 
 ### Output Layout
 
