@@ -21,3 +21,5 @@ gpu_test2.log
 test_warmup.py
 warmup_test.log
 dll_test.log
+scale_test.log
+test_scale.py
